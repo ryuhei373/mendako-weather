@@ -1,0 +1,19 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --env-file=.env --watch main.ts",
+    "start": "deno run --allow-net --allow-env main.ts",
+    "check": "deno check main.ts",
+    "fmt": "deno fmt",
+    "lint": "deno lint",
+    "deploy": "deployctl deploy --project=mendako-weather --prod --entrypoint=main.ts"
+  },
+  "unstable": ["cron"],
+  "fmt": {
+    "lineWidth": 100
+  },
+  "lint": {
+    "rules": {
+      "tags": ["recommended"]
+    }
+  }
+}

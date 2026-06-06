@@ -54,7 +54,7 @@ deno task dev           # http://localhost:8000 が起動
 
 1. このリポジトリを GitHub に push
 2. https://dash.deno.com → **New Project** → リポジトリと `main.ts` を選択
-3. プロジェクト設定 **Environment Variables** に `SLACK_WEBHOOK_URL`（必要なら `AREA_CODE` 等）を登録
+3. プロジェクト設定 **Environment Variables** に `SLACK_WEBHOOK_URL`・`AREA_CODE` を登録
 4. push のたびに自動デプロイ。`Deno.cron` は自動で有効化される
 
 **B. CLI（deployctl）**
@@ -70,8 +70,7 @@ deployctl deploy --project=mendako-weather --prod --entrypoint=main.ts
 | 環境変数 | 説明 | 例 |
 |----------|------|----|
 | `SLACK_WEBHOOK_URL` | Slack Incoming Webhook（**必須**） | `https://hooks.slack.com/services/...` |
-| `AREA_CODE` | 気象庁の府県予報区コード | 東京都=`130000`, 大阪府=`270000`, 愛知県=`230000`, 福岡県=`400000` |
-| `AREA_NAME` | 表示名 | `東京都` |
+| `AREA_CODE` | 気象庁の府県予報区コード（**必須**）。名称は `area-codes.ts` から自動解決 | `130000`, `270000`, `230000`, `400000` |
 | `FORECAST_AREA_INDEX` | `timeSeries[0].areas` の何番目を使うか | 東京都は `0`（東京地方） |
 
 通知時刻は `main.ts` の `Deno.cron(...)` の cron 式を編集（UTC 基準・JST から -9h）:

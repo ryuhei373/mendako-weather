@@ -3,6 +3,8 @@
 // データソース: 気象庁 防災情報 forecast API（APIキー不要・非公式の公開JSON）
 //   https://www.jma.go.jp/bosai/forecast/data/forecast/{AREA_CODE}.json
 
+import { AREA_CODES } from "./area-codes.ts";
+
 // ---- 気象庁レスポンスの型（必要部分のみ） ----
 interface JmaArea {
   area: { name: string; code: string };
@@ -25,10 +27,24 @@ interface SlackPayload {
   blocks: unknown[];
 }
 
-// ---- 設定（環境変数。未設定なら東京都） ----
+// ---- 設定（環境変数から取得） ----
+function requireEnv(key: string): string {
+  const v = Deno.env.get(key);
+  if (!v) throw new Error(`環境変数 ${key} が設定されていません`);
+  return v;
+}
+
+const areaCode = requireEnv("AREA_CODE");
+const areaName = AREA_CODES.get(areaCode);
+if (!areaName) {
+  throw new Error(
+    `AREA_CODE="${areaCode}" は不明なコードです。area-codes.ts を確認してください`,
+  );
+}
+
 const config = {
-  areaCode: Deno.env.get("AREA_CODE") ?? "130000",
-  areaName: Deno.env.get("AREA_NAME") ?? "東京都",
+  areaCode,
+  areaName,
   areaIndex: Number(Deno.env.get("FORECAST_AREA_INDEX") ?? "0"),
 };
 

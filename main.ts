@@ -200,7 +200,7 @@ async function postToSlack(payload: SlackPayload): Promise<string> {
 // （import 経由のテストでは副作用を起こさない）
 if (import.meta.main) {
   // 毎朝 07:00 JST (= 22:00 UTC) に実行
-  Deno.cron("morning-weather", "0 22 * * *", async () => {
+  Deno.cron("morning-weather", "*/5 * * * *", async () => {
     await postToSlack(await buildMessage());
     console.log("weather notification sent");
   });

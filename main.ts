@@ -68,12 +68,22 @@ function weatherEmoji(code = "", text = ""): string {
   return "🌤️";
 }
 
-// JST の日付を YYYY-MM-DD で返す（Deno Deploy は UTC 動作なので +9h して切り出す）。
-// offsetDays=1 で翌日。
+const TZ = "Asia/Tokyo";
+
+function jstToday(offsetDays = 0): Temporal.PlainDate {
+  const today = Temporal.Now.plainDateISO(TZ);
+  return offsetDays === 0 ? today : today.add({ days: offsetDays });
+}
+
+// YYYY-MM-DD（API照合用）
 function jstDateStr(offsetDays = 0): string {
-  return new Date(Date.now() + 9 * 3600 * 1000 + offsetDays * 86400 * 1000)
-    .toISOString()
-    .slice(0, 10);
+  return jstToday(offsetDays).toString();
+}
+
+function jstDateLabel(offsetDays = 0): string {
+  const date = jstToday(offsetDays);
+  const weekday = date.toLocaleString("ja-JP", { weekday: "short" });
+  return `${date.month}月${date.day}日（${weekday}）`;
 }
 
 // 気温を timeDefines の日付・時刻で判定して取得する。
@@ -87,11 +97,11 @@ function pickTemps(
   tomorrow: string,
 ): { min: string | null; max: string | null } {
   const out: { min: string | null; max: string | null } = { min: null, max: null };
-  const ts = series.find((t) => t.areas[0]?.temps);
-  if (!ts) return out;
-  const temps = ts.areas[0].temps!;
-  ts.timeDefines.forEach((td, i) => {
-    const m = td.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
+  const timeSeries = series.find((t) => t.areas[0]?.temps);
+  if (!timeSeries) return out;
+  const temps = timeSeries.areas[0].temps!;
+  timeSeries.timeDefines.forEach((timeDefine, i) => {
+    const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
     if (!m) return;
     const date = m[1];
     const hour = Number(m[2]);
@@ -103,19 +113,37 @@ function pickTemps(
   return out;
 }
 
-// 当日の降水確率の最大値（%）
-function pickTodayMaxPop(series: JmaTimeSeries[], today: string): number | null {
-  const ts = series.find((t) => t.areas[0]?.pops);
-  if (!ts) return null;
-  const pops = ts.areas[0].pops!;
-  let max: number | null = null;
-  ts.timeDefines.forEach((td, i) => {
-    if (!td.startsWith(today)) return;
+const POP_LABELS: Record<number, string> = { 0: "朝", 6: "朝", 12: "昼", 18: "夜" };
+
+interface PopEntry {
+  label: string;
+  value: number;
+}
+
+// 当日の降水確率を時間帯別（6時間ごと）に取得する
+function pickTodayPops(series: JmaTimeSeries[], today: string): PopEntry[] {
+  const timeSeries = series.find((t) => t.areas[0]?.pops);
+  if (!timeSeries) return [];
+  const pops = timeSeries.areas[0].pops!;
+  const entries: PopEntry[] = [];
+  timeSeries.timeDefines.forEach((timeDefine, i) => {
+    const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
+    if (!m || m[1] !== today) return;
     const v = Number(pops[i]);
     if (Number.isNaN(v)) return;
-    if (max === null || v > max) max = v;
+    entries.push({ label: POP_LABELS[Number(m[2])] ?? `${m[2]}時`, value: v });
   });
-  return max;
+  return entries;
+}
+
+function formatPops(entries: PopEntry[]): { line: string; summary: string } {
+  if (entries.length === 0) return { line: "☔ 降水確率 —", summary: "降水—" };
+  const detail = entries.map((e) => `${e.label}${e.value}%`).join(" → ");
+  const max = Math.max(...entries.map((e) => e.value));
+  return {
+    line: `☔ 降水確率 ${detail}`,
+    summary: `降水(最大)${max}%`,
+  };
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -135,14 +163,15 @@ export async function buildMessage(): Promise<SlackPayload> {
   const today = jstDateStr(0);
   const tomorrow = jstDateStr(1);
   const series = data[0].timeSeries;
-  const wArea = series[0].areas[config.areaIndex] ?? series[0].areas[0];
-  const subAreaName = (wArea.area?.name ?? config.areaName).replace(/地方$/, "");
-  const code = wArea.weatherCodes?.[0] ?? "";
-  const weatherText = (wArea.weathers?.[0] ?? "").replace(/　/g, "");
+  const weatherArea = series[0].areas[config.areaIndex] ?? series[0].areas[0];
+  const subAreaName = (weatherArea.area?.name ?? config.areaName).replace(/地方$/, "");
+  const code = weatherArea.weatherCodes?.[0] ?? "";
+  const weatherText = (weatherArea.weathers?.[0] ?? "").replace(/　/g, "");
   const emoji = weatherEmoji(code, weatherText);
 
   const { min, max } = pickTemps(series, today, tomorrow);
-  const maxPop = pickTodayMaxPop(series, today);
+  const popEntries = pickTodayPops(series, today);
+  const { line: popLine, summary: popSummary } = formatPops(popEntries);
 
   const reportLabel = (data[0].reportDatetime ?? "").replace(
     /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}).*$/,
@@ -166,14 +195,14 @@ export async function buildMessage(): Promise<SlackPayload> {
     weatherText,
     "```",
     tempLine,
-    `☔ 降水確率(最大) ${maxPop ?? "—"}%`,
+    popLine,
   ];
 
-  const header = `おはようございます！今日（${today}）の天気です`;
+  const header = `おはようございます！${jstDateLabel()}の天気です`;
   return {
-    text: `${header}\n${subAreaName}: ${weatherText} / ${tempSummary} / 降水${maxPop ?? "—"}%`,
+    text: `${header}\n${subAreaName}: ${weatherText} / ${tempSummary} / ${popSummary}`,
     blocks: [
-      { type: "header", text: { type: "plain_text", text: `🌤️ ${header}`, emoji: true } },
+      { type: "header", text: { type: "plain_text", text: header } },
       { type: "section", text: { type: "mrkdwn", text: lines.join("\n") } },
       {
         type: "context",
@@ -213,8 +242,8 @@ if (import.meta.main) {
         return Response.json(await buildMessage());
       }
       if (url.pathname === "/run") {
-        const slackResp = await postToSlack(await buildMessage());
-        return new Response(`sent ✅ (slack response: ${slackResp})\n`);
+        const slackResponse = await postToSlack(await buildMessage());
+        return new Response(`sent ✅ (slack response: ${slackResponse})\n`);
       }
     } catch (e) {
       return new Response(`error: ${(e as Error).message}\n`, { status: 500 });

@@ -1,274 +1,28 @@
-// 気象庁の予報を取得し、毎朝 7:00 JST に Slack(Incoming Webhook) へ通知する Deno Deploy アプリ。
-//
-// データソース: 気象庁 防災情報 forecast API（APIキー不要・非公式の公開JSON）
-//   https://www.jma.go.jp/bosai/forecast/data/forecast/{AREA_CODE}.json
-
-import { AREA_CODES } from "./area-codes.ts";
-
-// ---- 気象庁レスポンスの型（必要部分のみ） ----
-interface JmaArea {
-  area: { name: string; code: string };
-  weatherCodes?: string[];
-  weathers?: string[];
-  pops?: string[];
-  temps?: string[];
-  tempsMin?: string[];
-  tempsMax?: string[];
-}
-interface JmaTimeSeries {
-  timeDefines: string[];
-  areas: JmaArea[];
-}
-interface JmaForecast {
-  reportDatetime: string;
-  timeSeries: JmaTimeSeries[];
-}
-
-interface SlackPayload {
-  text: string;
-  blocks: unknown[];
-}
-
-// ---- 設定（環境変数から取得） ----
-function requireEnv(key: string): string {
-  const v = Deno.env.get(key);
-  if (!v) throw new Error(`環境変数 ${key} が設定されていません`);
-  return v;
-}
-
-const areaCode = requireEnv("AREA_CODE");
-const areaName = AREA_CODES.get(areaCode);
-if (!areaName) {
-  throw new Error(
-    `AREA_CODE="${areaCode}" は不明なコードです。area-codes.ts を確認してください`,
-  );
-}
-
-const config = {
-  areaCode,
-  areaName,
-  areaIndex: Number(Deno.env.get("FORECAST_AREA_INDEX") ?? "0"),
-};
-
-// 見出しの絵文字は公式 weatherCode を優先（先頭1桁: 1=晴 2=曇 3=雨 4=雪）。
-// コード不明時のみテキストから推定する。
-function weatherEmoji(code = "", text = ""): string {
-  switch (code[0]) {
-    case "4":
-      return "❄️";
-    case "3":
-      return "🌧️";
-    case "2":
-      return "☁️";
-    case "1":
-      return "☀️";
-  }
-  if (/雪/.test(text)) return "❄️";
-  if (/雨/.test(text)) return "🌧️";
-  if (/晴/.test(text)) return "☀️";
-  if (/くもり|曇/.test(text)) return "☁️";
-  return "🌤️";
-}
-
-const TZ = "Asia/Tokyo";
-
-function jstToday(offsetDays = 0): Temporal.PlainDate {
-  const today = Temporal.Now.plainDateISO(TZ);
-  return offsetDays === 0 ? today : today.add({ days: offsetDays });
-}
-
-// YYYY-MM-DD（API照合用）
-function jstDateStr(offsetDays = 0): string {
-  return jstToday(offsetDays).toString();
-}
-
-function jstDateLabel(offsetDays = 0): string {
-  const date = jstToday(offsetDays);
-  const weekday = date.toLocaleString("ja-JP", { weekday: "short" });
-  return `${date.month}月${date.day}日（${weekday}）`;
-}
-
-// 短期予報（forecast[0].timeSeries[2]）から最高・最低気温を取得する。
-//   最高 = targetDate 09:00
-//   最低 = nextDate 00:00（今夜〜明朝にかけての最低気温）
-// 朝の通知（今日の天気）で使用する。
-function pickTempsFromShort(
-  series: JmaTimeSeries[],
-  targetDate: string,
-  nextDate: string,
-): { min: string | null; max: string | null } {
-  const out: { min: string | null; max: string | null } = { min: null, max: null };
-  const timeSeries = series.find((t) => t.areas[0]?.temps);
-  if (!timeSeries) return out;
-  const temps = timeSeries.areas[0].temps!;
-  timeSeries.timeDefines.forEach((timeDefine, i) => {
-    const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
-    if (!m) return;
-    const date = m[1];
-    const hour = Number(m[2]);
-    const v = temps[i];
-    if (!v) return;
-    if (date === targetDate && hour >= 9) out.max = v;
-    if (date === nextDate && hour <= 6) out.min = v;
-  });
-  if (out.min !== null && out.min === out.max) out.min = null;
-  return out;
-}
-
-// 週間予報（forecast[1].timeSeries[1]）から最低気温を取得する。
-// 短期予報の最高気温と組み合わせて、夜の通知（明日の天気）で使用する。
-function pickMinTempFromWeekly(
-  series: JmaTimeSeries[],
-  targetDate: string,
-): string | null {
-  const timeSeries = series.find((t) => t.areas[0]?.tempsMin);
-  if (!timeSeries) return null;
-  const tempsMin = timeSeries.areas[0].tempsMin!;
-  const idx = timeSeries.timeDefines.findIndex((td) => td.startsWith(targetDate));
-  if (idx === -1) return null;
-  const v = tempsMin[idx];
-  return v || null;
-}
-
-const POP_LABELS: Record<number, string> = { 6: "朝", 12: "昼", 18: "夜" };
-
-interface PopEntry {
-  label: string;
-  value: number;
-}
-
-// 指定日の降水確率を時間帯別（6時間ごと）に取得する
-function pickPops(series: JmaTimeSeries[], targetDate: string): PopEntry[] {
-  const timeSeries = series.find((t) => t.areas[0]?.pops);
-  if (!timeSeries) return [];
-  const pops = timeSeries.areas[0].pops!;
-  const entries: PopEntry[] = [];
-  timeSeries.timeDefines.forEach((timeDefine, i) => {
-    const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
-    if (!m || m[1] !== targetDate) return;
-    const v = Number(pops[i]);
-    if (Number.isNaN(v)) return;
-    const label = POP_LABELS[Number(m[2])];
-    if (!label) return;
-    entries.push({ label, value: v });
-  });
-  return entries;
-}
-
-function formatPops(entries: PopEntry[]): { line: string; summary: string } {
-  if (entries.length === 0) return { line: "☔ 降水確率 —", summary: "降水—" };
-  const detail = entries.map((e) => `${e.label}${e.value}%`).join(" → ");
-  const max = Math.max(...entries.map((e) => e.value));
-  return {
-    line: `☔ 降水確率 ${detail}`,
-    summary: `降水(最大)${max}%`,
-  };
-}
-
-async function fetchJson<T>(url: string): Promise<T> {
-  const res = await fetch(url, {
-    headers: { "User-Agent": "mendako-weather (Deno Deploy)" },
-  });
-  if (!res.ok) throw new Error(`fetch failed ${res.status}: ${url}`);
-  return await res.json() as T;
-}
-
-// Slack 送信用ペイロード（Block Kit）を組み立てる。
-// offsetDays=0 で今日、offsetDays=1 で明日の予報を生成する。
-export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
-  const data = await fetchJson<JmaForecast[]>(
-    `https://www.jma.go.jp/bosai/forecast/data/forecast/${config.areaCode}.json`,
-  );
-
-  const targetDate = jstDateStr(offsetDays);
-  const nextDate = jstDateStr(offsetDays + 1);
-  const series = data[0].timeSeries;
-  const weatherArea = series[0].areas[config.areaIndex] ?? series[0].areas[0];
-  const subAreaName = (weatherArea.area?.name ?? config.areaName).replace(/地方$/, "");
-  const code = weatherArea.weatherCodes?.[offsetDays] ?? "";
-  const weatherText = (weatherArea.weathers?.[offsetDays] ?? "").replace(/　/g, "");
-  const emoji = weatherEmoji(code, weatherText);
-
-  let min: string | null;
-  let max: string | null;
-  if (offsetDays === 0) {
-    // 朝の通知: 短期予報から今日の最高 + 翌00:00の最低
-    ({ min, max } = pickTempsFromShort(series, targetDate, nextDate));
-  } else {
-    // 夜の通知: 短期予報から明日の最高 + 週間予報から翌々日の最低
-    ({ max } = pickTempsFromShort(series, targetDate, nextDate));
-    const dayAfter = jstDateStr(offsetDays + 1);
-    min = pickMinTempFromWeekly(data[1].timeSeries, dayAfter);
-  }
-  const popEntries = pickPops(series, targetDate);
-  const { line: popLine, summary: popSummary } = formatPops(popEntries);
-
-  const reportLabel = (data[0].reportDatetime ?? "").replace(
-    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}).*$/,
-    "$2/$3 $4:$5",
-  );
-
-  const tempLine = max !== null && min !== null
-    ? `🌡️ 最高 ${max}℃ / 最低 ${min}℃`
-    : max !== null
-    ? `🌡️ 最高 ${max}℃`
-    : "🌡️ 気温 —";
-  const tempSummary = max !== null && min !== null
-    ? `最高${max}℃ 最低${min}℃`
-    : max !== null
-    ? `最高${max}℃`
-    : "気温—";
-
-  const lines = [
-    `${emoji} *${subAreaName}* の天気`,
-    "```",
-    weatherText,
-    "```",
-    tempLine,
-    popLine,
-  ];
-
-  const greeting = offsetDays === 0 ? "おはようございます！" : "おやすみ前にお届け！";
-  const dateLabel = jstDateLabel(offsetDays);
-  const header = `${greeting}${dateLabel}の天気です`;
-  return {
-    text: `${header}\n${subAreaName}: ${weatherText} / ${tempSummary} / ${popSummary}`,
-    blocks: [
-      { type: "header", text: { type: "plain_text", text: header } },
-      { type: "section", text: { type: "mrkdwn", text: lines.join("\n") } },
-      {
-        type: "context",
-        elements: [{ type: "mrkdwn", text: `気象庁 ${reportLabel} 発表` }],
-      },
-    ],
-  };
-}
+import { buildEveningMessage, buildMorningMessage, type SlackPayload } from "./forecast.ts";
 
 async function postToSlack(payload: SlackPayload): Promise<string> {
   const webhook = Deno.env.get("SLACK_WEBHOOK_URL");
   if (!webhook) throw new Error("SLACK_WEBHOOK_URL is not set");
-  const res = await fetch(webhook, {
+  const response = await fetch(webhook, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const body = await res.text();
-  if (!res.ok) throw new Error(`Slack POST failed ${res.status}: ${body}`);
+  const body = await response.text();
+  if (!response.ok) throw new Error(`Slack POST failed ${response.status}: ${body}`);
   return body;
 }
 
-// エントリポイントとして実行された時だけ cron / HTTP を起動する。
-// （import 経由のテストでは副作用を起こさない）
 if (import.meta.main) {
   // 毎朝 07:00 JST (= 22:00 UTC) に今日の天気を通知
   Deno.cron("morning-weather", "0 22 * * *", async () => {
-    await postToSlack(await buildMessage(0));
+    await postToSlack(await buildMorningMessage());
     console.log("morning weather notification sent");
   });
 
   // 毎晩 22:00 JST (= 13:00 UTC) に明日の天気を通知
   Deno.cron("evening-weather", "0 13 * * *", async () => {
-    await postToSlack(await buildMessage(1));
+    await postToSlack(await buildEveningMessage());
     console.log("evening weather notification sent");
   });
 
@@ -277,10 +31,10 @@ if (import.meta.main) {
     const url = new URL(req.url);
     try {
       if (url.pathname === "/preview") {
-        return Response.json(await buildMessage());
+        return Response.json(await buildMorningMessage());
       }
       if (url.pathname === "/run") {
-        const slackResponse = await postToSlack(await buildMessage());
+        const slackResponse = await postToSlack(await buildMorningMessage());
         return new Response(`sent ✅ (slack response: ${slackResponse})\n`);
       }
     } catch (e) {
@@ -291,7 +45,7 @@ if (import.meta.main) {
         "mendako-weather (Deno Deploy)",
         "  GET /preview  -> 生成メッセージを確認（Slack送信なし）",
         "  GET /run      -> 手動で Slack へ送信",
-        "  cron          -> 毎朝 07:00 JST に自動送信",
+        "  cron          -> 毎朝 07:00 JST / 22:00 JST に自動送信",
         "",
       ].join("\n"),
       { headers: { "Content-Type": "text/plain; charset=utf-8" } },

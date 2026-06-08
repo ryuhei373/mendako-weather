@@ -33,9 +33,7 @@ const ForecastResponseSchema = z.array(ForecastBlockSchema).min(2);
 
 // ---- 型エクスポート ----
 
-export type JmaArea = z.infer<typeof AreaSchema>;
 export type JmaTimeSeries = z.infer<typeof TimeSeriesSchema>;
-export type JmaForecastBlock = z.infer<typeof ForecastBlockSchema>;
 export type JmaForecastResponse = z.infer<typeof ForecastResponseSchema>;
 
 // ---- API クライアント ----

@@ -1,4 +1,4 @@
-import { buildMessage, type SlackPayload } from "./forecast.ts";
+import { buildEveningMessage, buildMorningMessage, type SlackPayload } from "./forecast.ts";
 
 async function postToSlack(payload: SlackPayload): Promise<string> {
   const webhook = Deno.env.get("SLACK_WEBHOOK_URL");
@@ -16,13 +16,13 @@ async function postToSlack(payload: SlackPayload): Promise<string> {
 if (import.meta.main) {
   // 毎朝 07:00 JST (= 22:00 UTC) に今日の天気を通知
   Deno.cron("morning-weather", "0 22 * * *", async () => {
-    await postToSlack(await buildMessage(0));
+    await postToSlack(await buildMorningMessage());
     console.log("morning weather notification sent");
   });
 
   // 毎晩 22:00 JST (= 13:00 UTC) に明日の天気を通知
   Deno.cron("evening-weather", "0 13 * * *", async () => {
-    await postToSlack(await buildMessage(1));
+    await postToSlack(await buildEveningMessage());
     console.log("evening weather notification sent");
   });
 
@@ -31,10 +31,10 @@ if (import.meta.main) {
     const url = new URL(req.url);
     try {
       if (url.pathname === "/preview") {
-        return Response.json(await buildMessage());
+        return Response.json(await buildMorningMessage());
       }
       if (url.pathname === "/run") {
-        const slackResponse = await postToSlack(await buildMessage());
+        const slackResponse = await postToSlack(await buildMorningMessage());
         return new Response(`sent ✅ (slack response: ${slackResponse})\n`);
       }
     } catch (e) {

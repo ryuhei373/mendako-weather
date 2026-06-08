@@ -1,5 +1,5 @@
 import { AREA_CODES } from "./area-codes.ts";
-import { fetchForecast, type JmaForecastResponse, type JmaTimeSeries } from "./jma-client.ts";
+import { fetchForecast, type JmaTimeSeries } from "./jma-client.ts";
 
 // ---- 設定 ----
 
@@ -15,27 +15,17 @@ if (!areaName) {
   throw new Error(`AREA_CODE="${areaCode}" は不明なコードです。area-codes.ts を確認してください`);
 }
 
-const config = {
-  areaCode,
-  areaName,
-  areaIndex: Number(Deno.env.get("FORECAST_AREA_INDEX") ?? "0"),
-};
+const areaIndex = Number(Deno.env.get("FORECAST_AREA_INDEX") ?? "0");
 
 // ---- 日付ユーティリティ ----
 
 const TZ = "Asia/Tokyo";
 
-function jstToday(offsetDays = 0): Temporal.PlainDate {
-  const today = Temporal.Now.plainDateISO(TZ);
-  return offsetDays === 0 ? today : today.add({ days: offsetDays });
+function jstToday(): Temporal.PlainDate {
+  return Temporal.Now.plainDateISO(TZ);
 }
 
-function jstDateStr(offsetDays = 0): string {
-  return jstToday(offsetDays).toString();
-}
-
-function jstDateLabel(offsetDays = 0): string {
-  const date = jstToday(offsetDays);
+function dateLabel(date: Temporal.PlainDate): string {
   const weekday = date.toLocaleString("ja-JP", { weekday: "short" });
   return `${date.month}月${date.day}日（${weekday}）`;
 }
@@ -70,7 +60,8 @@ function pickTempsFromShort(
   const out: { min: string | null; max: string | null } = { min: null, max: null };
   const timeSeries = series.find((t) => t.areas[0]?.temps);
   if (!timeSeries) return out;
-  const temps = timeSeries.areas[0].temps!;
+  const area = timeSeries.areas[areaIndex] ?? timeSeries.areas[0];
+  const temps = area.temps!;
   timeSeries.timeDefines.forEach((timeDefine, i) => {
     const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
     if (!m) return;
@@ -91,7 +82,8 @@ function pickMinTempFromWeekly(
 ): string | null {
   const timeSeries = series.find((t) => t.areas[0]?.tempsMin);
   if (!timeSeries) return null;
-  const tempsMin = timeSeries.areas[0].tempsMin!;
+  const area = timeSeries.areas[areaIndex] ?? timeSeries.areas[0];
+  const tempsMin = area.tempsMin!;
   const idx = timeSeries.timeDefines.findIndex((td) => td.startsWith(targetDate));
   if (idx === -1) return null;
   const v = tempsMin[idx];
@@ -110,7 +102,8 @@ interface PopEntry {
 function pickPops(series: JmaTimeSeries[], targetDate: string): PopEntry[] {
   const timeSeries = series.find((t) => t.areas[0]?.pops);
   if (!timeSeries) return [];
-  const pops = timeSeries.areas[0].pops!;
+  const area = timeSeries.areas[areaIndex] ?? timeSeries.areas[0];
+  const pops = area.pops!;
   const entries: PopEntry[] = [];
   timeSeries.timeDefines.forEach((timeDefine, i) => {
     const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
@@ -134,6 +127,24 @@ function formatPops(entries: PopEntry[]): { line: string; summary: string } {
   };
 }
 
+// ---- 気温フォーマット ----
+
+function formatTemp(
+  max: string | null,
+  min: string | null,
+): { line: string; summary: string } {
+  if (max !== null && min !== null) {
+    return {
+      line: `🌡️ 最高 ${max}℃ / 最低 ${min}℃`,
+      summary: `最高${max}℃ 最低${min}℃`,
+    };
+  }
+  if (max !== null) {
+    return { line: `🌡️ 最高 ${max}℃`, summary: `最高${max}℃` };
+  }
+  return { line: "🌡️ 気温 —", summary: "気温—" };
+}
+
 // ---- メッセージ組み立て ----
 
 export interface SlackPayload {
@@ -141,28 +152,26 @@ export interface SlackPayload {
   blocks: unknown[];
 }
 
-export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
-  const data: JmaForecastResponse = await fetchForecast(config.areaCode);
+async function buildMessage(offsetDays: number): Promise<SlackPayload> {
+  const data = await fetchForecast(areaCode);
 
-  const targetDate = jstDateStr(offsetDays);
-  const nextDate = jstDateStr(offsetDays + 1);
+  const today = jstToday();
+  const targetDate = today.add({ days: offsetDays });
+  const nextDate = targetDate.add({ days: 1 });
+  const targetDateStr = targetDate.toString();
+  const nextDateStr = nextDate.toString();
   const series = data[0].timeSeries;
-  const weatherArea = series[0].areas[config.areaIndex] ?? series[0].areas[0];
-  const subAreaName = (weatherArea.area?.name ?? config.areaName).replace(/地方$/, "");
+  const weatherArea = series[0].areas[areaIndex] ?? series[0].areas[0];
+  const subAreaName = (weatherArea.area?.name ?? areaName).replace(/地方$/, "");
   const code = weatherArea.weatherCodes?.[offsetDays] ?? "";
   const weatherText = (weatherArea.weathers?.[offsetDays] ?? "").replace(/　/g, "");
   const emoji = weatherEmoji(code, weatherText);
 
-  let min: string | null;
-  let max: string | null;
-  if (offsetDays === 0) {
-    ({ min, max } = pickTempsFromShort(series, targetDate, nextDate));
-  } else {
-    ({ max } = pickTempsFromShort(series, targetDate, nextDate));
-    const dayAfter = jstDateStr(offsetDays + 1);
-    min = pickMinTempFromWeekly(data[1].timeSeries, dayAfter);
-  }
-  const popEntries = pickPops(series, targetDate);
+  const { min: shortMin, max } = pickTempsFromShort(series, targetDateStr, nextDateStr);
+  const min = offsetDays === 0
+    ? shortMin
+    : pickMinTempFromWeekly(data[1].timeSeries, nextDateStr);
+  const popEntries = pickPops(series, targetDateStr);
   const { line: popLine, summary: popSummary } = formatPops(popEntries);
 
   const reportLabel = (data[0].reportDatetime ?? "").replace(
@@ -170,16 +179,7 @@ export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
     "$2/$3 $4:$5",
   );
 
-  const tempLine = max !== null && min !== null
-    ? `🌡️ 最高 ${max}℃ / 最低 ${min}℃`
-    : max !== null
-    ? `🌡️ 最高 ${max}℃`
-    : "🌡️ 気温 —";
-  const tempSummary = max !== null && min !== null
-    ? `最高${max}℃ 最低${min}℃`
-    : max !== null
-    ? `最高${max}℃`
-    : "気温—";
+  const { line: tempLine, summary: tempSummary } = formatTemp(max, min);
 
   const lines = [
     `${emoji} *${subAreaName}* の天気`,
@@ -191,8 +191,8 @@ export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
   ];
 
   const greeting = offsetDays === 0 ? "おはようございます！" : "おやすみ前にお届け！";
-  const dateLabel = jstDateLabel(offsetDays);
-  const header = `${greeting}${dateLabel}の天気です`;
+  const label = dateLabel(targetDate);
+  const header = `${greeting}${label}の天気です`;
   return {
     text: `${header}\n${subAreaName}: ${weatherText} / ${tempSummary} / ${popSummary}`,
     blocks: [
@@ -204,4 +204,12 @@ export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
       },
     ],
   };
+}
+
+export function buildMorningMessage(): Promise<SlackPayload> {
+  return buildMessage(0);
+}
+
+export function buildEveningMessage(): Promise<SlackPayload> {
+  return buildMessage(1);
 }

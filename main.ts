@@ -113,25 +113,27 @@ function pickTemps(
   return out;
 }
 
-const POP_LABELS: Record<number, string> = { 0: "朝", 6: "朝", 12: "昼", 18: "夜" };
+const POP_LABELS: Record<number, string> = { 6: "朝", 12: "昼", 18: "夜" };
 
 interface PopEntry {
   label: string;
   value: number;
 }
 
-// 当日の降水確率を時間帯別（6時間ごと）に取得する
-function pickTodayPops(series: JmaTimeSeries[], today: string): PopEntry[] {
+// 指定日の降水確率を時間帯別（6時間ごと）に取得する
+function pickPops(series: JmaTimeSeries[], targetDate: string): PopEntry[] {
   const timeSeries = series.find((t) => t.areas[0]?.pops);
   if (!timeSeries) return [];
   const pops = timeSeries.areas[0].pops!;
   const entries: PopEntry[] = [];
   timeSeries.timeDefines.forEach((timeDefine, i) => {
     const m = timeDefine.match(/^(\d{4}-\d{2}-\d{2})T(\d{2})/);
-    if (!m || m[1] !== today) return;
+    if (!m || m[1] !== targetDate) return;
     const v = Number(pops[i]);
     if (Number.isNaN(v)) return;
-    entries.push({ label: POP_LABELS[Number(m[2])] ?? `${m[2]}時`, value: v });
+    const label = POP_LABELS[Number(m[2])];
+    if (!label) return;
+    entries.push({ label, value: v });
   });
   return entries;
 }
@@ -154,23 +156,24 @@ async function fetchJson<T>(url: string): Promise<T> {
   return await res.json() as T;
 }
 
-// Slack 送信用ペイロード（Block Kit）を組み立てる
-export async function buildMessage(): Promise<SlackPayload> {
+// Slack 送信用ペイロード（Block Kit）を組み立てる。
+// offsetDays=0 で今日、offsetDays=1 で明日の予報を生成する。
+export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
   const data = await fetchJson<JmaForecast[]>(
     `https://www.jma.go.jp/bosai/forecast/data/forecast/${config.areaCode}.json`,
   );
 
-  const today = jstDateStr(0);
-  const tomorrow = jstDateStr(1);
+  const targetDate = jstDateStr(offsetDays);
+  const nextDate = jstDateStr(offsetDays + 1);
   const series = data[0].timeSeries;
   const weatherArea = series[0].areas[config.areaIndex] ?? series[0].areas[0];
   const subAreaName = (weatherArea.area?.name ?? config.areaName).replace(/地方$/, "");
-  const code = weatherArea.weatherCodes?.[0] ?? "";
-  const weatherText = (weatherArea.weathers?.[0] ?? "").replace(/　/g, "");
+  const code = weatherArea.weatherCodes?.[offsetDays] ?? "";
+  const weatherText = (weatherArea.weathers?.[offsetDays] ?? "").replace(/　/g, "");
   const emoji = weatherEmoji(code, weatherText);
 
-  const { min, max } = pickTemps(series, today, tomorrow);
-  const popEntries = pickTodayPops(series, today);
+  const { min, max } = pickTemps(series, targetDate, nextDate);
+  const popEntries = pickPops(series, targetDate);
   const { line: popLine, summary: popSummary } = formatPops(popEntries);
 
   const reportLabel = (data[0].reportDatetime ?? "").replace(
@@ -198,7 +201,9 @@ export async function buildMessage(): Promise<SlackPayload> {
     popLine,
   ];
 
-  const header = `おはようございます！${jstDateLabel()}の天気です`;
+  const greeting = offsetDays === 0 ? "おはようございます！" : "おやすみ前にお届け！";
+  const dateLabel = jstDateLabel(offsetDays);
+  const header = `${greeting}${dateLabel}の天気です`;
   return {
     text: `${header}\n${subAreaName}: ${weatherText} / ${tempSummary} / ${popSummary}`,
     blocks: [
@@ -228,10 +233,16 @@ async function postToSlack(payload: SlackPayload): Promise<string> {
 // エントリポイントとして実行された時だけ cron / HTTP を起動する。
 // （import 経由のテストでは副作用を起こさない）
 if (import.meta.main) {
-  // 毎朝 07:00 JST (= 22:00 UTC) に実行
+  // 毎朝 07:00 JST (= 22:00 UTC) に今日の天気を通知
   Deno.cron("morning-weather", "0 22 * * *", async () => {
-    await postToSlack(await buildMessage());
-    console.log("weather notification sent");
+    await postToSlack(await buildMessage(0));
+    console.log("morning weather notification sent");
+  });
+
+  // 毎晩 22:00 JST (= 13:00 UTC) に明日の天気を通知
+  Deno.cron("evening-weather", "0 13 * * *", async () => {
+    await postToSlack(await buildMessage(1));
+    console.log("evening weather notification sent");
   });
 
   // 動作確認用 HTTP エンドポイント

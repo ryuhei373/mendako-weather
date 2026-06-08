@@ -12,6 +12,8 @@ interface JmaArea {
   weathers?: string[];
   pops?: string[];
   temps?: string[];
+  tempsMin?: string[];
+  tempsMax?: string[];
 }
 interface JmaTimeSeries {
   timeDefines: string[];
@@ -86,15 +88,14 @@ function jstDateLabel(offsetDays = 0): string {
   return `${date.month}月${date.day}日（${weekday}）`;
 }
 
-// 気温を timeDefines の日付・時刻で判定して取得する。
-//   最高 = 今日09:00（今日の最高気温）
-//   最低 = 明日00:00（今夜〜明朝にかけての最低気温）
-// 当日の最低(今日00:00)は発表時点で既に経過し、最高気温と同値の縮退データになることがある。
-// 一方 明日00:00 は常に未来の予報値なので縮退せず、朝の通知では「今夜の冷え込み」を表す。
-function pickTemps(
+// 短期予報（forecast[0].timeSeries[2]）から最高・最低気温を取得する。
+//   最高 = targetDate 09:00
+//   最低 = nextDate 00:00（今夜〜明朝にかけての最低気温）
+// 朝の通知（今日の天気）で使用する。
+function pickTempsFromShort(
   series: JmaTimeSeries[],
-  today: string,
-  tomorrow: string,
+  targetDate: string,
+  nextDate: string,
 ): { min: string | null; max: string | null } {
   const out: { min: string | null; max: string | null } = { min: null, max: null };
   const timeSeries = series.find((t) => t.areas[0]?.temps);
@@ -107,10 +108,26 @@ function pickTemps(
     const hour = Number(m[2]);
     const v = temps[i];
     if (!v) return;
-    if (date === today && hour >= 9) out.max = v; // 今日の最高気温
-    else if (date === tomorrow && hour <= 6) out.min = v; // 今夜〜明朝の最低気温
+    if (date === targetDate && hour >= 9) out.max = v;
+    if (date === nextDate && hour <= 6) out.min = v;
   });
+  if (out.min !== null && out.min === out.max) out.min = null;
   return out;
+}
+
+// 週間予報（forecast[1].timeSeries[1]）から最低気温を取得する。
+// 短期予報の最高気温と組み合わせて、夜の通知（明日の天気）で使用する。
+function pickMinTempFromWeekly(
+  series: JmaTimeSeries[],
+  targetDate: string,
+): string | null {
+  const timeSeries = series.find((t) => t.areas[0]?.tempsMin);
+  if (!timeSeries) return null;
+  const tempsMin = timeSeries.areas[0].tempsMin!;
+  const idx = timeSeries.timeDefines.findIndex((td) => td.startsWith(targetDate));
+  if (idx === -1) return null;
+  const v = tempsMin[idx];
+  return v || null;
 }
 
 const POP_LABELS: Record<number, string> = { 6: "朝", 12: "昼", 18: "夜" };
@@ -172,7 +189,17 @@ export async function buildMessage(offsetDays = 0): Promise<SlackPayload> {
   const weatherText = (weatherArea.weathers?.[offsetDays] ?? "").replace(/　/g, "");
   const emoji = weatherEmoji(code, weatherText);
 
-  const { min, max } = pickTemps(series, targetDate, nextDate);
+  let min: string | null;
+  let max: string | null;
+  if (offsetDays === 0) {
+    // 朝の通知: 短期予報から今日の最高 + 翌00:00の最低
+    ({ min, max } = pickTempsFromShort(series, targetDate, nextDate));
+  } else {
+    // 夜の通知: 短期予報から明日の最高 + 週間予報から翌々日の最低
+    ({ max } = pickTempsFromShort(series, targetDate, nextDate));
+    const dayAfter = jstDateStr(offsetDays + 1);
+    min = pickMinTempFromWeekly(data[1].timeSeries, dayAfter);
+  }
   const popEntries = pickPops(series, targetDate);
   const { line: popLine, summary: popSummary } = formatPops(popEntries);
 
